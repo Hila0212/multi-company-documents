@@ -4,7 +4,7 @@ import hmac
 import zipfile
 import unicodedata
 from collections import OrderedDict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import openpyxl
@@ -28,6 +28,22 @@ def display(value):
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
+
+
+def invoice_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, (int, float)):
+        return openpyxl.utils.datetime.from_excel(value).date()
+    raw = str(value or "").strip()
+    for pattern in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(raw, pattern).date()
+        except ValueError:
+            pass
+    raise ValueError(f"Ngày hóa đơn không hợp lệ: {raw!r}. Hãy dùng ngày Excel hoặc DD/MM/YYYY.")
 
 
 def amount(value):
@@ -192,9 +208,8 @@ if not hmac.compare_digest(entered, password):
 st.caption("Thông tin pháp nhân và hóa đơn được tải lên khi sử dụng, không lưu vào GitHub.")
 with st.sidebar:
     st.subheader("Ngày chứng từ")
-    order_day = st.date_input("Ngày đặt hàng", date.today())
-    delivery_day = st.date_input("Ngày giao nhận", date.today())
-    use_invoice_day = st.checkbox("Lấy ngày theo hóa đơn", value=False)
+    order_date_placeholder = st.empty()
+    st.caption("Ngày giao nhận tự động theo từng ngày hóa đơn.")
     st.warning("Chỉ tải dữ liệu thật khi công ty chấp thuận xử lý trên Streamlit Cloud.")
 
 company_upload = st.file_uploader("1. Tải THÔNG TIN CÔNG TY.xlsx (chỉ quản trị viên giữ file)", type=["xlsx"], key="company")
@@ -231,6 +246,19 @@ except Exception as exc:
 if not groups:
     st.warning("Không tìm thấy hóa đơn hợp lệ.")
     st.stop()
+# Mặc định ngày đặt hàng = ngày hóa đơn đầu tiên trừ 7 ngày; kế toán được đổi thủ công.
+try:
+    default_order_day = invoice_date(next(iter(groups.values()))[0]["date"]) - timedelta(days=7)
+except (ValueError, TypeError, OverflowError) as exc:
+    st.error(str(exc))
+    st.stop()
+# Khi thay file hóa đơn, ngày mặc định được tính lại.
+invoice_identity = (invoice_upload.name, invoice_upload.size, invoice_upload.getvalue())
+if st.session_state.get("order_invoice_identity") != invoice_identity:
+    st.session_state["order_invoice_identity"] = invoice_identity
+    st.session_state["order_day_input"] = default_order_day
+order_day = order_date_placeholder.date_input("Ngày đặt hàng (có thể sửa)", key="order_day_input")
+st.sidebar.caption("Mặc định: ngày hóa đơn đầu tiên trừ 7 ngày. Nếu nhiều hóa đơn khác ngày, ngày đặt hàng đã chọn áp dụng cho cả lượt xuất.")
 st.success(f"Đọc được {len(groups)} hóa đơn, {sum(map(len, groups.values()))} dòng hàng.")
 labels = {f"{series} · {invoice} ({len(items)} dòng)": (series, invoice)
           for (series, invoice), items in groups.items()}
@@ -252,18 +280,18 @@ if st.button("5. Tạo và đóng gói chứng từ", type="primary", disabled=n
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for series, invoice in valid:
             items = groups[(series, invoice)]
-            when_order = display(items[0]["date"]) if use_invoice_day else order_day.strftime("%d/%m/%Y")
-            when_delivery = display(items[0]["date"]) if use_invoice_day else delivery_day.strftime("%d/%m/%Y")
+            when_order = order_day.strftime("%d/%m/%Y")
+            when_delivery = invoice_date(items[0]["date"]).strftime("%d/%m/%Y")
             data = make_document(items, invoice, company, code, when_order, when_delivery)
             safe_invoice = re.sub(r"[^a-zA-Z0-9_-]", "_", invoice)
             safe_series = re.sub(r"[^a-zA-Z0-9_-]", "_", series)
             archive.writestr(f"{code}_{safe_series}_{safe_invoice}_DonDH_BBGN.xlsx", data)
     st.session_state["generated"] = {"data": output.getvalue(), "tax": tax,
                                      "signature": (invoice_upload.getvalue(), company_upload.getvalue(), tuple(selected),
-                                                   str(order_day), str(delivery_day), use_invoice_day), "count": len(valid)}
+                                                   str(order_day)), "count": len(valid)}
 result = st.session_state.get("generated")
 current_signature = (invoice_upload.getvalue(), company_upload.getvalue(), tuple(selected),
-                     str(order_day), str(delivery_day), use_invoice_day)
+                     str(order_day))
 if result and result["tax"] == tax and result["signature"] == current_signature:
     st.download_button(f"⬇️ Tải ZIP ({result['count']} bộ chứng từ)", result["data"],
                        file_name=f"{code}_chung_tu.zip", mime="application/zip")
